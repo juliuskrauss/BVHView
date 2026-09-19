@@ -30,7 +30,7 @@ ifeq ($(PLATFORM),PLATFORM_DESKTOP)
         else
             CFLAGS ?= $(DEFINES) -Wall -Wno-format-truncation -g $(INCLUDE_DIR) $(LIBRARY_DIR)
         endif
-        LIBS = -lraylib -lGL -lm
+        LIBS = -lraylib -lGL -lm -lX11
     endif
     
     ifeq ($(findstring MINGW,$(PLATFORM_OS)),MINGW)

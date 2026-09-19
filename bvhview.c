@@ -3384,6 +3384,251 @@ static inline void ScrubberSettingsClamp(ScrubberSettings* settings, CharacterDa
     settings->playTime = Clamp(settings->playTime, settings->timeMin, settings->timeMax);
 }
 
+//--------------------------------------
+// Recorder
+//--------------------------------------
+
+// Plays the animation back at a fixed timestep into an off-screen target that never sees the
+// UI, writes each step out as a PNG, and hands the sequence to ffmpeg unless PNGs were what
+// was asked for. Stepping the clock by hand keeps the output at the requested frame rate no
+// matter how long a frame took to draw.
+
+enum
+{
+    RECORDER_FORMAT_MP4 = 0,
+    RECORDER_FORMAT_GIF = 1,
+    RECORDER_FORMAT_PNG = 2,
+};
+
+static const char* recorderExtensions[3] = { "mp4", "gif", "png" };
+static const int recorderFrameRates[4] = { 24, 25, 30, 60 };
+
+// A width of zero means "whatever the window currently is"
+static const int recorderSizes[5][2] = { { 0, 0 }, { 1280, 720 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 } };
+
+typedef struct {
+
+    bool windowActive;
+    bool recording;
+    bool startRequested;
+    bool cancelRequested;
+
+    int format;
+    int frameRate;
+    int size;
+    bool rangeOnly;
+    bool antialias;
+    bool transparent;
+    char outputDir[512];
+    char outputName[128];
+    bool outputDirEdit;
+    bool outputNameEdit;
+
+    int frameIndex;
+    int frameCount;
+    float timeStart;
+    float timeEnd;
+    int width;
+    int height;
+    RenderTexture2D target;
+
+    float restorePlayTime;
+    bool restorePlaying;
+
+    char statusMsg[512];
+    bool statusError;
+    double statusTime;
+
+} RecorderSettings;
+
+static inline void RecorderSettingsInit(RecorderSettings* settings, int argc, char** argv)
+{
+    memset(settings, 0, sizeof(RecorderSettings));
+
+    settings->format = ArgEnum(argc, argv, "recordFormat", 3, (const char*[]){ "mp4", "gif", "png" }, RECORDER_FORMAT_MP4);
+    settings->frameRate = ArgEnum(argc, argv, "recordFrameRate", 4, (const char*[]){ "24", "25", "30", "60" }, 2);
+    settings->size = ArgEnum(argc, argv, "recordSize", 5, (const char*[]){ "window", "720p", "1080p", "1440p", "2160p" }, 2);
+    settings->rangeOnly = ArgBool(argc, argv, "recordRangeOnly", false);
+    settings->antialias = ArgBool(argc, argv, "recordAntialias", true);
+    settings->transparent = ArgBool(argc, argv, "recordTransparent", false);
+
+    snprintf(settings->outputDir, 512, "%s", ArgStr(argc, argv, "recordDir", GetWorkingDirectory()));
+    snprintf(settings->outputName, 128, "%s", ArgStr(argc, argv, "recordName", "bvhview"));
+}
+
+static inline int RecorderFrameRate(const RecorderSettings* settings)
+{
+    return recorderFrameRates[ClampInt(settings->frameRate, 0, 3)];
+}
+
+static inline void RecorderSize(const RecorderSettings* settings, int screenWidth, int screenHeight, int* width, int* height)
+{
+    int size = ClampInt(settings->size, 0, 4);
+
+    *width = recorderSizes[size][0] ? recorderSizes[size][0] : screenWidth;
+    *height = recorderSizes[size][0] ? recorderSizes[size][1] : screenHeight;
+
+    // h.264 with 4:2:0 chroma rejects odd dimensions
+    *width -= *width % 2;
+    *height -= *height % 2;
+}
+
+static inline int RecorderFrameCount(const RecorderSettings* settings, const ScrubberSettings* scrubber)
+{
+    float duration = settings->rangeOnly ? scrubber->timeMax - scrubber->timeMin : scrubber->timeLimit;
+
+    return MaxInt(1, (int)(Max(duration, 0.0f) * RecorderFrameRate(settings) + 0.5f) + 1);
+}
+
+// PNG output is the deliverable and keeps the plain name. For video the frames are scratch
+// files and get a marked one, so the cleanup at the end cannot eat anything else.
+static inline const char* RecorderFramePath(const RecorderSettings* settings, int frame)
+{
+    return TextFormat(settings->format == RECORDER_FORMAT_PNG ? "%s/%s_%05i.png" : "%s/%s_tmp_%05i.png",
+        settings->outputDir, settings->outputName, frame);
+}
+
+static inline void RecorderSetStatus(RecorderSettings* settings, bool error, const char* msg)
+{
+    snprintf(settings->statusMsg, 512, "%s", msg);
+    settings->statusError = error;
+    settings->statusTime = GetTime();
+}
+
+static inline bool RecorderHasFFmpeg()
+{
+#if defined(PLATFORM_WEB)
+    return false;
+#elif defined(_WIN32)
+    return system("ffmpeg -version > NUL 2>&1") == 0;
+#else
+    return system("ffmpeg -version > /dev/null 2>&1") == 0;
+#endif
+}
+
+static void RecorderStart(
+    RecorderSettings* settings,
+    ScrubberSettings* scrubber,
+    CharacterData* characterData,
+    int screenWidth,
+    int screenHeight)
+{
+    if (characterData->count == 0)
+    {
+        RecorderSetStatus(settings, true, "Load a BVH file before recording."); return;
+    }
+
+    if (settings->outputName[0] == '\0')
+    {
+        RecorderSetStatus(settings, true, "Give the recording a file name."); return;
+    }
+
+    if (!DirectoryExists(settings->outputDir))
+    {
+        RecorderSetStatus(settings, true, TextFormat("No such folder: %s", settings->outputDir)); return;
+    }
+
+    if (settings->format != RECORDER_FORMAT_PNG && !RecorderHasFFmpeg())
+    {
+        RecorderSetStatus(settings, true, "ffmpeg was not found on PATH. Choose PNG Frames instead."); return;
+    }
+
+    RecorderSize(settings, screenWidth, screenHeight, &settings->width, &settings->height);
+
+    // Render targets have no MSAA, so render at double size and scale down on export
+    int scale = settings->antialias ? 2 : 1;
+    settings->target = LoadRenderTexture(settings->width * scale, settings->height * scale);
+
+    if (settings->target.texture.id == 0)
+    {
+        RecorderSetStatus(settings, true, "Could not allocate the render target. Try a smaller size."); return;
+    }
+
+    settings->timeStart = settings->rangeOnly ? scrubber->timeMin : 0.0f;
+    settings->timeEnd = Max(settings->rangeOnly ? scrubber->timeMax : scrubber->timeLimit, settings->timeStart);
+    settings->frameCount = RecorderFrameCount(settings, scrubber);
+    settings->frameIndex = 0;
+    settings->restorePlayTime = scrubber->playTime;
+    settings->restorePlaying = scrubber->playing;
+    settings->recording = true;
+    settings->windowActive = false;
+    settings->statusMsg[0] = '\0';
+    scrubber->playing = false;
+
+    // Render as fast as the machine allows rather than at the display rate
+    SetTargetFPS(0);
+}
+
+static bool RecorderCaptureFrame(RecorderSettings* settings)
+{
+    Image image = LoadImageFromTexture(settings->target.texture);
+    ImageFlipVertical(&image);
+
+    if (image.width != settings->width) { ImageResize(&image, settings->width, settings->height); }
+
+    // Only a PNG sequence carries the alpha channel through to the output
+    if (!(settings->transparent && settings->format == RECORDER_FORMAT_PNG))
+    {
+        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+    }
+
+    bool exported = ExportImage(image, RecorderFramePath(settings, settings->frameIndex));
+    UnloadImage(image);
+
+    return exported;
+}
+
+// Ends a recording, encoding the frames first if it ran to the end and a video was asked for.
+// A non-NULL failure means it stopped early, and is copied before any TextFormat below.
+static void RecorderStop(RecorderSettings* settings, ScrubberSettings* scrubber, const char* failure)
+{
+    char message[512];
+    int fps = RecorderFrameRate(settings);
+    bool video = settings->format != RECORDER_FORMAT_PNG;
+    bool cancelled = settings->cancelRequested;
+
+    if (failure != NULL)
+    {
+        snprintf(message, 512, "%s", failure);
+    }
+    else if (!video)
+    {
+        snprintf(message, 512, "Saved %i frames to %s", settings->frameCount, RecorderFramePath(settings, 0));
+    }
+    else
+    {
+        char output[640];
+        snprintf(output, 640, "%s/%s.%s", settings->outputDir, settings->outputName, recorderExtensions[settings->format]);
+
+        char command[1024];
+        snprintf(command, 1024, settings->format == RECORDER_FORMAT_MP4 ?
+            "ffmpeg -y -loglevel error -framerate %i -i \"%s/%s_tmp_%%05d.png\" "
+                "-c:v libx264 -preset slow -crf 17 -pix_fmt yuv420p \"%s\"" :
+            // One pass builds a palette for the clip and one applies it, otherwise the GIF
+            // falls back to the 216 colour web palette and bands badly
+            "ffmpeg -y -loglevel error -framerate %i -i \"%s/%s_tmp_%%05d.png\" "
+                "-filter_complex \"[0:v] split [a][b];[a] palettegen [p];[b][p] paletteuse\" \"%s\"",
+            fps, settings->outputDir, settings->outputName, output);
+
+        if (system(command) == 0) { snprintf(message, 512, "Saved %s  (%i frames at %i fps)", output, settings->frameCount, fps); }
+        else { failure = message; snprintf(message, 512, "ffmpeg failed. Details are in the terminal output."); }
+    }
+
+    if (video) { for (int i = 0; i < settings->frameIndex; i++) { remove(RecorderFramePath(settings, i)); } }
+
+    UnloadRenderTexture(settings->target);
+    settings->target = (RenderTexture2D){ 0 };
+    settings->recording = false;
+    settings->cancelRequested = false;
+
+    scrubber->playTime = settings->restorePlayTime;
+    scrubber->playing = settings->restorePlaying;
+
+    RecorderSetStatus(settings, failure != NULL && !cancelled, message);
+
+    SetTargetFPS(60);
+}
+
 //----------------------------------------------------------------------------------
 // Drawing
 //----------------------------------------------------------------------------------
@@ -3498,9 +3743,9 @@ static inline void GuiOrbitCamera(OrbitCamera* camera, CharacterData* characterD
     }
 }
 
-static inline void GuiRenderSettings(RenderSettings* settings, CapsuleData* capsuleData, int screenWidth, int screenHeight)
+static inline void GuiRenderSettings(RenderSettings* settings, CapsuleData* capsuleData, RecorderSettings* recorder, int screenWidth, int screenHeight)
 {
-    GuiGroupBox((Rectangle){ screenWidth - 260, 10, 240, 430 }, "Rendering");
+    GuiGroupBox((Rectangle){ screenWidth - 260, 10, 240, 460 }, "Rendering");
 
     GuiSliderBar(
         (Rectangle){ screenWidth - 160, 20, 100, 20 },
@@ -3573,6 +3818,13 @@ static inline void GuiRenderSettings(RenderSettings* settings, CapsuleData* caps
     GuiCheckBox((Rectangle){ screenWidth - 130, 380, 20, 20 }, "Draw End Sites", &settings->drawEndSites);
     GuiCheckBox((Rectangle){ screenWidth - 250, 410, 20, 20 }, "Draw FPS", &settings->drawFPS);
     GuiLabel((Rectangle){ screenWidth - 130, 410, 100, 20 }, "H Key - Hide UI");
+
+    GuiLine((Rectangle){ screenWidth - 250, 428, 220, 10 }, NULL);
+
+    if (GuiButton((Rectangle){ screenWidth - 250, 438, 220, 26 }, "#135#Record Animation   (F9)"))
+    {
+        recorder->windowActive = !recorder->windowActive;
+    }
 }
 
 static inline void GuiCharacterData(
@@ -3768,6 +4020,97 @@ static inline void GuiScrubberSettings(
     }
 }
 
+static inline void GuiRecorderSettings(
+    RecorderSettings* settings,
+    ScrubberSettings* scrubber,
+    CharacterData* characterData,
+    OrbitCamera* camera,
+    int screenWidth,
+    int screenHeight)
+{
+    // Sits near the top rather than centred, so the subject stays visible below it while
+    // the shot is being framed.
+    float x = screenWidth / 2 - 235;
+    float y = 60;
+
+    if (GuiWindowBox((Rectangle){ x, y, 470, 288 }, "#135#Record Animation")) { settings->windowActive = false; }
+
+    GuiLabel((Rectangle){ x + 14, y + 34, 60, 20 }, "Folder");
+    if (GuiTextBox((Rectangle){ x + 78, y + 34, 378, 20 }, settings->outputDir, 512, settings->outputDirEdit))
+    {
+        settings->outputDirEdit = !settings->outputDirEdit;
+    }
+
+    GuiLabel((Rectangle){ x + 14, y + 62, 60, 20 }, "Name");
+    if (GuiTextBox((Rectangle){ x + 78, y + 62, 378, 20 }, settings->outputName, 128, settings->outputNameEdit))
+    {
+        settings->outputNameEdit = !settings->outputNameEdit;
+    }
+
+    GuiLabel((Rectangle){ x + 14, y + 92, 60, 20 }, "Format");
+    GuiComboBox((Rectangle){ x + 78, y + 92, 150, 20 }, "MP4 Video;GIF;PNG Frames", &settings->format);
+    GuiLabel((Rectangle){ x + 240, y + 92, 76, 20 }, "Frame Rate");
+    GuiComboBox((Rectangle){ x + 320, y + 92, 136, 20 }, "24 fps;25 fps;30 fps;60 fps", &settings->frameRate);
+
+    GuiLabel((Rectangle){ x + 14, y + 120, 60, 20 }, "Size");
+    GuiComboBox((Rectangle){ x + 78, y + 120, 150, 20 }, "Window;720p;1080p;1440p;2160p", &settings->size);
+    GuiCheckBox((Rectangle){ x + 240, y + 120, 20, 20 }, "Only the In-Out Range", &settings->rangeOnly);
+
+    GuiCheckBox((Rectangle){ x + 14, y + 148, 20, 20 }, "Smooth Edges", &settings->antialias);
+
+    // Alpha only survives in a PNG sequence
+    if (settings->format != RECORDER_FORMAT_PNG) { GuiDisable(); }
+    GuiCheckBox((Rectangle){ x + 240, y + 148, 20, 20 }, "Transparent Background", &settings->transparent);
+    if (settings->format != RECORDER_FORMAT_PNG) { GuiEnable(); }
+
+    // Framing the shot, live on the scene behind the panel. Mouse scroll does the same.
+    GuiSliderBar((Rectangle){ x + 78, y + 176, 150, 20 }, "Zoom",
+        TextFormat("%5.2f", camera->distance), &camera->distance, 0.5f, 20.0f);
+    GuiSliderBar((Rectangle){ x + 320, y + 176, 136, 20 }, "Height",
+        TextFormat("%5.2f", camera->altitude), &camera->altitude, 0.0f, 0.4f * PI);
+
+    int width, height, frameCount = RecorderFrameCount(settings, scrubber);
+    RecorderSize(settings, screenWidth, screenHeight, &width, &height);
+
+    GuiLine((Rectangle){ x + 14, y + 198, 442, 10 }, NULL);
+    GuiLabel((Rectangle){ x + 14, y + 212, 442, 20 }, TextFormat("%i frames   %.2f s   %i x %i   writes %s.%s",
+        frameCount, (float)(frameCount - 1) / RecorderFrameRate(settings), width, height,
+        settings->outputName, recorderExtensions[settings->format]));
+
+    if (characterData->count == 0) { GuiDisable(); }
+    if (GuiButton((Rectangle){ x + 14, y + 240, 250, 32 }, "#135#Start Recording")) { settings->startRequested = true; }
+    if (characterData->count == 0) { GuiEnable(); }
+
+    if (GuiButton((Rectangle){ x + 280, y + 240, 176, 32 }, "Close")) { settings->windowActive = false; }
+}
+
+// Shown in place of the whole interface while recording. The preview is the render target
+// itself, letterboxed, so what is on screen is framed exactly like the output file.
+static inline void GuiRecorderOverlay(RecorderSettings* settings, int screenWidth, int screenHeight)
+{
+    float aspect = (float)settings->target.texture.width / (float)settings->target.texture.height;
+    float previewWidth = Min((float)screenWidth, (float)screenHeight * aspect);
+    float previewHeight = previewWidth / aspect;
+
+    ClearBackground((Color){ 25, 25, 25, 255 });
+
+    DrawTexturePro(
+        settings->target.texture,
+        (Rectangle){ 0.0f, 0.0f, (float)settings->target.texture.width, -(float)settings->target.texture.height },
+        (Rectangle){ (screenWidth - previewWidth) / 2, (screenHeight - previewHeight) / 2, previewWidth, previewHeight },
+        Vector2Zero(), 0.0f, WHITE);
+
+    float progress = (float)settings->frameIndex / (float)MaxInt(1, settings->frameCount);
+    float x = screenWidth / 2 - 230;
+    float y = screenHeight - 110;
+
+    GuiPanel((Rectangle){ x, y, 460, 86 }, "#135#Recording");
+    GuiProgressBar((Rectangle){ x + 14, y + 32, 432, 18 }, NULL, NULL, &progress, 0.0f, 1.0f);
+    GuiLabel((Rectangle){ x + 14, y + 54, 300, 20 }, TextFormat("Frame %i of %i", settings->frameIndex, settings->frameCount));
+
+    if (GuiButton((Rectangle){ x + 336, y + 54, 110, 22 }, "Cancel (Esc)")) { settings->cancelRequested = true; }
+}
+
 //----------------------------------------------------------------------------------
 // Application
 //----------------------------------------------------------------------------------
@@ -3795,6 +4138,7 @@ typedef struct {
 
     ScrubberSettings scrubberSettings;
     RenderSettings renderSettings;
+    RecorderSettings recorder;
 
     GuiWindowFileDialogState fileDialogState;
 
@@ -3802,207 +4146,17 @@ typedef struct {
 
 } ApplicationState;
 
-// Update function - what is called to "tick" the application.
-static void ApplicationUpdate(void* voidApplicationState)
+// Draws the 3D scene and nothing else, so the recorder can point it at an off-screen target
+// where none of the interface follows it.
+static void DrawScene(ApplicationState* app, Color clearColor)
 {
-    ApplicationState* app = voidApplicationState;
-
-    // Process File Dialog
-
-    if (app->fileDialogState.SelectFilePressed)
-    {
-        if (IsFileExtension(app->fileDialogState.fileNameText, ".bvh"))
-        {
-            char fileNameToLoad[512];
-            snprintf(fileNameToLoad, 512, "%s/%s", app->fileDialogState.dirPathText, app->fileDialogState.fileNameText);
-
-            if (CharacterDataLoadFromFile(&app->characterData, fileNameToLoad, app->errMsg, 512))
-            {
-                app->characterData.active = app->characterData.count - 1;
-
-                CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
-                ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
-                ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
-                
-                char windowTitle[512];
-                snprintf(windowTitle, 512, "%s - BVHView", app->characterData.filePaths[app->characterData.active]);
-                SetWindowTitle(windowTitle);
-            }
-        }
-        else
-        {
-            snprintf(app->errMsg, 512, "Error: File '%s' is not a BVH file.", app->fileDialogState.fileNameText);
-        }
-
-        app->fileDialogState.SelectFilePressed = false;
-    }
-
-    // Process Dragged and Dropped Files
-
-    if (IsFileDropped())
-    {
-        FilePathList droppedFiles = LoadDroppedFiles();
-
-        int prevBvhCount = app->characterData.count;
-
-        for (int i = 0; i < droppedFiles.count; i++)
-        {
-            if (CharacterDataLoadFromFile(&app->characterData, droppedFiles.paths[i], app->errMsg, 512))
-            {
-                app->characterData.active = app->characterData.count - 1;
-            }
-        }
-
-        UnloadDroppedFiles(droppedFiles);
-
-        if (app->characterData.count > prevBvhCount)
-        {
-            CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
-            ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
-            ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
-
-            char windowTitle[512];
-            snprintf(windowTitle, 512, "%s - BVHView", app->characterData.filePaths[app->characterData.active]);
-            SetWindowTitle(windowTitle);
-        }
-    }
-
-    // Process Key Presses
-
-    if (IsKeyPressed(KEY_H) && !app->fileDialogState.windowActive)
-    {
-        app->renderSettings.drawUI = !app->renderSettings.drawUI;
-    }
-
-    PROFILE_BEGIN(Update);
-
-    // Tick time forward
-
-    if (app->scrubberSettings.playing)
-    {
-        app->scrubberSettings.playTime += app->scrubberSettings.playSpeed * GetFrameTime();
-
-        if (app->scrubberSettings.playTime >= app->scrubberSettings.timeMax)
-        {
-            app->scrubberSettings.playTime = (app->scrubberSettings.looping && app->scrubberSettings.timeMax >= 1e-8f) ?
-                fmod(app->scrubberSettings.playTime, app->scrubberSettings.timeMax) + app->scrubberSettings.timeMin :
-                app->scrubberSettings.timeMax;
-        }
-    }
-
-    // Sample Animation Data
-
-    for (int i = 0; i < app->characterData.count; i++)
-    {
-        if (app->scrubberSettings.sampleMode == 0)
-        {
-            TransformDataSampleFrameNearest(
-                &app->characterData.xformData[i],
-                &app->characterData.bvhData[i],
-                app->scrubberSettings.playTime,
-                app->characterData.scales[i]);
-        }
-        else if (app->scrubberSettings.sampleMode == 1)
-        {
-            TransformDataSampleFrameLinear(
-                &app->characterData.xformData[i],
-                &app->characterData.xformTmp0[i],
-                &app->characterData.xformTmp1[i],
-                &app->characterData.bvhData[i],
-                app->scrubberSettings.playTime,
-                app->characterData.scales[i]);
-        }
-        else
-        {
-            TransformDataSampleFrameCubic(
-                &app->characterData.xformData[i],
-                &app->characterData.xformTmp0[i],
-                &app->characterData.xformTmp1[i],
-                &app->characterData.xformTmp2[i],
-                &app->characterData.xformTmp3[i],
-                &app->characterData.bvhData[i],
-                app->scrubberSettings.playTime,
-                app->characterData.scales[i]);
-        }
-
-        if (app->scrubberSettings.inplace)
-        {
-            // Remove Translation on ground Plane
-          
-            app->characterData.xformData[i].localPositions[0].x = 0.0f;
-            app->characterData.xformData[i].localPositions[0].z = 0.0f;
-            
-            // Attempt to extract rotation around vertical axis (this does not work 
-            // for all animations but is pretty effective for almost all of them)
-            
-            Quaternion verticalRotation = QuaternionInvert(QuaternionNormalize((Quaternion){
-                0.0f,
-                app->characterData.xformData[i].localRotations[0].y,
-                0.0f,
-                app->characterData.xformData[i].localRotations[0].w,
-            }));
-            
-            // Remove rotation around vertical axis
-            
-            app->characterData.xformData[i].localRotations[0] = QuaternionMultiply(
-                verticalRotation, 
-                app->characterData.xformData[i].localRotations[0]);
-        }
-
-        TransformDataForwardKinematics(&app->characterData.xformData[i]);
-    }
-
-    // Update Camera
-
-    Vector3 cameraTarget = (Vector3){ 0.0f, 1.0f, 0.0f };
-
-    if (app->characterData.count > 0 &&
-        app->camera.track &&
-        app->camera.trackBone < app->characterData.xformData[app->characterData.active].jointCount)
-    {
-        cameraTarget = app->characterData.xformData[app->characterData.active].globalPositions[app->camera.trackBone];
-    }
-
-    if (!app->fileDialogState.windowActive)
-    {
-        OrbitCameraUpdate(
-            &app->camera,
-            cameraTarget,
-            (IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(0)) ? GetMouseDelta().x : 0.0f,
-            (IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(0)) ? GetMouseDelta().y : 0.0f,
-            (IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(1)) ? GetMouseDelta().x : 0.0f,
-            (IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(1)) ? GetMouseDelta().y : 0.0f,
-            GetMouseWheelMove(),
-            GetFrameTime());
-    }
-
-    // Create Capsules
-
-    CapsuleDataReset(&app->capsuleData);
-    for (int i = 0; i < app->characterData.count; i++)
-    {
-        CapsuleDataAppendFromTransformData(
-            &app->capsuleData,
-            &app->characterData.xformData[i],
-            app->characterData.radii[i],
-            app->characterData.colors[i],
-            app->characterData.opacities[i],
-            !app->renderSettings.drawEndSites);
-    }
-
-    PROFILE_END(Update);
-
-    // Rendering
-
     Frustum frustum = FrustumFromCameraMatrices(
         GetCameraProjectionMatrix(&app->camera.cam3d, app->screenHeight / app->screenWidth),
         GetCameraViewMatrix(&app->camera.cam3d));
 
-    BeginDrawing();
-
     PROFILE_BEGIN(Rendering);
 
-    ClearBackground(app->renderSettings.backgroundColor);
+    ClearBackground(clearColor);
 
     BeginMode3D(app->camera.cam3d);
 
@@ -4294,18 +4448,290 @@ static void ApplicationUpdate(void* voidApplicationState)
     EndMode3D();
 
     PROFILE_END(Rendering);
+}
+
+// Update function - what is called to "tick" the application.
+static void ApplicationUpdate(void* voidApplicationState)
+{
+    ApplicationState* app = voidApplicationState;
+
+    // Process File Dialog
+
+    if (app->fileDialogState.SelectFilePressed)
+    {
+        if (IsFileExtension(app->fileDialogState.fileNameText, ".bvh"))
+        {
+            char fileNameToLoad[512];
+            snprintf(fileNameToLoad, 512, "%s/%s", app->fileDialogState.dirPathText, app->fileDialogState.fileNameText);
+
+            if (CharacterDataLoadFromFile(&app->characterData, fileNameToLoad, app->errMsg, 512))
+            {
+                app->characterData.active = app->characterData.count - 1;
+
+                CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
+                ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
+                ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
+                
+                char windowTitle[512];
+                snprintf(windowTitle, 512, "%s - BVHView", app->characterData.filePaths[app->characterData.active]);
+                SetWindowTitle(windowTitle);
+            }
+        }
+        else
+        {
+            snprintf(app->errMsg, 512, "Error: File '%s' is not a BVH file.", app->fileDialogState.fileNameText);
+        }
+
+        app->fileDialogState.SelectFilePressed = false;
+    }
+
+    // Process Dragged and Dropped Files
+
+    if (IsFileDropped())
+    {
+        FilePathList droppedFiles = LoadDroppedFiles();
+
+        int prevBvhCount = app->characterData.count;
+
+        for (int i = 0; i < droppedFiles.count; i++)
+        {
+            if (CharacterDataLoadFromFile(&app->characterData, droppedFiles.paths[i], app->errMsg, 512))
+            {
+                app->characterData.active = app->characterData.count - 1;
+            }
+        }
+
+        UnloadDroppedFiles(droppedFiles);
+
+        if (app->characterData.count > prevBvhCount)
+        {
+            CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
+            ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
+            ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
+
+            char windowTitle[512];
+            snprintf(windowTitle, 512, "%s - BVHView", app->characterData.filePaths[app->characterData.active]);
+            SetWindowTitle(windowTitle);
+        }
+    }
+
+    // Process Key Presses
+
+    bool textBoxActive = app->recorder.outputDirEdit || app->recorder.outputNameEdit;
+
+    if (IsKeyPressed(KEY_H) && !app->fileDialogState.windowActive && !textBoxActive && !app->recorder.recording)
+    {
+        app->renderSettings.drawUI = !app->renderSettings.drawUI;
+    }
+
+    if (IsKeyPressed(KEY_F9) && !app->fileDialogState.windowActive && !app->recorder.recording)
+    {
+        app->recorder.windowActive = !app->recorder.windowActive;
+        app->renderSettings.drawUI = true;
+    }
+
+    // Escape is raylib's exit key, so it has to be taken away while the recorder is up,
+    // otherwise closing the panel or cancelling a take quits the whole application.
+    SetExitKey((app->recorder.windowActive || app->recorder.recording) ? KEY_NULL : KEY_ESCAPE);
+
+    if (IsKeyPressed(KEY_ESCAPE))
+    {
+        if (app->recorder.recording) { app->recorder.cancelRequested = true; }
+        else if (app->recorder.windowActive) { app->recorder.windowActive = false; }
+    }
+
+    // Process Recorder
+
+    if (app->recorder.startRequested)
+    {
+        app->recorder.startRequested = false;
+        RecorderStart(&app->recorder, &app->scrubberSettings, &app->characterData, app->screenWidth, app->screenHeight);
+    }
+
+    if (app->recorder.cancelRequested)
+    {
+        RecorderStop(&app->recorder, &app->scrubberSettings,
+            TextFormat("Recording cancelled after %i frames.", app->recorder.frameIndex));
+    }
+
+    PROFILE_BEGIN(Update);
+
+    // Tick time forward
+
+    if (app->recorder.recording)
+    {
+        app->scrubberSettings.playTime = Clamp(
+            app->recorder.timeStart + (float)app->recorder.frameIndex / (float)RecorderFrameRate(&app->recorder),
+            app->recorder.timeStart, app->recorder.timeEnd);
+    }
+    else if (app->scrubberSettings.playing)
+    {
+        app->scrubberSettings.playTime += app->scrubberSettings.playSpeed * GetFrameTime();
+
+        if (app->scrubberSettings.playTime >= app->scrubberSettings.timeMax)
+        {
+            app->scrubberSettings.playTime = (app->scrubberSettings.looping && app->scrubberSettings.timeMax >= 1e-8f) ?
+                fmod(app->scrubberSettings.playTime, app->scrubberSettings.timeMax) + app->scrubberSettings.timeMin :
+                app->scrubberSettings.timeMax;
+        }
+    }
+
+    // Sample Animation Data
+
+    for (int i = 0; i < app->characterData.count; i++)
+    {
+        if (app->scrubberSettings.sampleMode == 0)
+        {
+            TransformDataSampleFrameNearest(
+                &app->characterData.xformData[i],
+                &app->characterData.bvhData[i],
+                app->scrubberSettings.playTime,
+                app->characterData.scales[i]);
+        }
+        else if (app->scrubberSettings.sampleMode == 1)
+        {
+            TransformDataSampleFrameLinear(
+                &app->characterData.xformData[i],
+                &app->characterData.xformTmp0[i],
+                &app->characterData.xformTmp1[i],
+                &app->characterData.bvhData[i],
+                app->scrubberSettings.playTime,
+                app->characterData.scales[i]);
+        }
+        else
+        {
+            TransformDataSampleFrameCubic(
+                &app->characterData.xformData[i],
+                &app->characterData.xformTmp0[i],
+                &app->characterData.xformTmp1[i],
+                &app->characterData.xformTmp2[i],
+                &app->characterData.xformTmp3[i],
+                &app->characterData.bvhData[i],
+                app->scrubberSettings.playTime,
+                app->characterData.scales[i]);
+        }
+
+        if (app->scrubberSettings.inplace)
+        {
+            // Remove Translation on ground Plane
+          
+            app->characterData.xformData[i].localPositions[0].x = 0.0f;
+            app->characterData.xformData[i].localPositions[0].z = 0.0f;
+            
+            // Attempt to extract rotation around vertical axis (this does not work 
+            // for all animations but is pretty effective for almost all of them)
+            
+            Quaternion verticalRotation = QuaternionInvert(QuaternionNormalize((Quaternion){
+                0.0f,
+                app->characterData.xformData[i].localRotations[0].y,
+                0.0f,
+                app->characterData.xformData[i].localRotations[0].w,
+            }));
+            
+            // Remove rotation around vertical axis
+            
+            app->characterData.xformData[i].localRotations[0] = QuaternionMultiply(
+                verticalRotation, 
+                app->characterData.xformData[i].localRotations[0]);
+        }
+
+        TransformDataForwardKinematics(&app->characterData.xformData[i]);
+    }
+
+    // Update Camera
+
+    Vector3 cameraTarget = (Vector3){ 0.0f, 1.0f, 0.0f };
+
+    if (app->characterData.count > 0 &&
+        app->camera.track &&
+        app->camera.trackBone < app->characterData.xformData[app->characterData.active].jointCount)
+    {
+        cameraTarget = app->characterData.xformData[app->characterData.active].globalPositions[app->camera.trackBone];
+    }
+
+    if (!app->fileDialogState.windowActive)
+    {
+        // The camera still updates while recording, that is what follows the tracked bone.
+        // Only the mouse is ignored, so a stray drag cannot move the shot mid-take.
+        bool mouse = !app->recorder.recording;
+
+        OrbitCameraUpdate(
+            &app->camera,
+            cameraTarget,
+            (mouse && IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(0)) ? GetMouseDelta().x : 0.0f,
+            (mouse && IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(0)) ? GetMouseDelta().y : 0.0f,
+            (mouse && IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(1)) ? GetMouseDelta().x : 0.0f,
+            (mouse && IsKeyDown(KEY_LEFT_CONTROL) && IsMouseButtonDown(1)) ? GetMouseDelta().y : 0.0f,
+            mouse ? GetMouseWheelMove() : 0.0f,
+            GetFrameTime());
+    }
+
+    // Create Capsules
+
+    CapsuleDataReset(&app->capsuleData);
+    for (int i = 0; i < app->characterData.count; i++)
+    {
+        CapsuleDataAppendFromTransformData(
+            &app->capsuleData,
+            &app->characterData.xformData[i],
+            app->characterData.radii[i],
+            app->characterData.colors[i],
+            app->characterData.opacities[i],
+            !app->renderSettings.drawEndSites);
+    }
+
+    PROFILE_END(Update);
+
+    // Rendering
+
+    // While recording, the scene is only rendered into the recorder's target. The window
+    // then shows that target instead, so the frames on disk never contain any interface.
+
+    if (app->recorder.recording)
+    {
+        bool transparent = app->recorder.transparent && app->recorder.format == RECORDER_FORMAT_PNG;
+
+        BeginTextureMode(app->recorder.target);
+        DrawScene(app, transparent ? (Color){ 0, 0, 0, 0 } : app->renderSettings.backgroundColor);
+        EndTextureMode();
+
+        if (!RecorderCaptureFrame(&app->recorder))
+        {
+            RecorderStop(&app->recorder, &app->scrubberSettings, "Could not write the frame. Check the folder and free space.");
+        }
+        else if (++app->recorder.frameIndex >= app->recorder.frameCount)
+        {
+            RecorderStop(&app->recorder, &app->scrubberSettings, NULL);
+        }
+    }
+
+    BeginDrawing();
+
+    if (app->recorder.recording)
+    {
+        GuiRecorderOverlay(&app->recorder, app->screenWidth, app->screenHeight);
+    }
+    else
+    {
+        DrawScene(app, app->renderSettings.backgroundColor);
+    }
 
     // Draw UI
 
     PROFILE_BEGIN(Gui);
 
-    if (app->renderSettings.drawUI)
+    if (app->renderSettings.drawUI && !app->recorder.recording)
     {
-        if (app->fileDialogState.windowActive) { GuiLock(); }
+        if (app->fileDialogState.windowActive || app->recorder.windowActive) { GuiLock(); }
 
         // Error Message
 
         DrawText(app->errMsg, 250, 20, 15, RED);
+
+        if (GetTime() - app->recorder.statusTime < 12.0)
+        {
+            DrawText(app->recorder.statusMsg, 250, 40, 15, app->recorder.statusError ? RED : DARKGREEN);
+        }
 
         if (app->characterData.count == 0)
         {
@@ -4315,7 +4741,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         // Render Settings
 
-        GuiRenderSettings(&app->renderSettings, &app->capsuleData, app->screenWidth, app->screenHeight);
+        GuiRenderSettings(&app->renderSettings, &app->capsuleData, &app->recorder, app->screenWidth, app->screenHeight);
 
         // FPS
 
@@ -4336,18 +4762,25 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         if (app->characterData.colorPickerActive)
         {
-            GuiGroupBox((Rectangle){ app->screenWidth - 180, 450, 160, 140 }, "Color Picker");
-            GuiColorPicker((Rectangle){ app->screenWidth - 165, 465, 110, 110 }, NULL, &app->characterData.colors[app->characterData.active]);
+            GuiGroupBox((Rectangle){ app->screenWidth - 180, 476, 160, 140 }, "Color Picker");
+            GuiColorPicker((Rectangle){ app->screenWidth - 165, 491, 110, 110 }, NULL, &app->characterData.colors[app->characterData.active]);
         }
 
         // Scrubber
 
         GuiScrubberSettings(&app->scrubberSettings, &app->characterData, app->screenWidth, app->screenHeight);
 
+        // Recorder
+
+        if (app->fileDialogState.windowActive || app->recorder.windowActive) { GuiUnlock(); }
+
+        if (app->recorder.windowActive && !app->fileDialogState.windowActive)
+        {
+            GuiRecorderSettings(&app->recorder, &app->scrubberSettings, &app->characterData, &app->camera, app->screenWidth, app->screenHeight);
+        }
+
         // File Dialog
 
-        if (app->fileDialogState.windowActive) { GuiUnlock(); }
-        
         GuiWindowFileDialog(&app->fileDialogState);
     }
 
@@ -4429,6 +4862,10 @@ int main(int argc, char** argv)
     // Render Settings
 
     RenderSettingsInit(&app.renderSettings, argc, argv);
+
+    // Recorder
+
+    RecorderSettingsInit(&app.recorder, argc, argv);
     CapsuleDataUpdateShadowLookupTable(&app.capsuleData, app.renderSettings.sunLightConeAngle);
 
     // File Dialog
@@ -4475,6 +4912,8 @@ int main(int argc, char** argv)
 #endif
 
     // Unload and finish
+
+    if (app.recorder.target.texture.id != 0) { UnloadRenderTexture(app.recorder.target); }
 
     CapsuleDataFree(&app.capsuleData);
     CharacterDataFree(&app.characterData);
